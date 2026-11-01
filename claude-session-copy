@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Copy a Claude Code session, and optionally its memory notes, so it can be resumed
+# from another folder. The original is kept and nothing is ever overwritten.
+#
+# This relies on how Claude Code stores sessions (~/.claude/projects/<encoded-path>/),
+# which is not an official interface and may change.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: claude-session-copy [--dry-run] [--no-memory] SESSION_ID [TARGET_DIR]
+
+Copies SESSION_ID to the project for TARGET_DIR (default: your home folder), then prints
+the command to resume it there. Exit Claude in that session first.
+
+  --dry-run    show what would be copied, and change nothing
+  --no-memory  copy only the conversation, not the project's memory notes
+EOF
+}
+
+die() { printf 'claude-session-copy: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+dry=0; memory=1; args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry=1 ;;
+    --no-memory) memory=0 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 2 ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+[ "${#args[@]}" -ge 1 ] && [ "${#args[@]}" -le 2 ] || { usage >&2; exit 2; }
+
+id="${args[0]}"
+[[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "not a session ID: $id"
+target="$(cd "${args[1]:-$HOME}" 2>/dev/null && pwd -P)" || die "no such folder: ${args[1]:-$HOME}"
+
+projects="$HOME/.claude/projects"
+[ -d "$projects" ] || die "no Claude projects at $projects"
+
+# Claude names each project folder after its path, with non-alphanumerics replaced by '-'.
+to="$projects/$(printf '%s' "$target" | sed 's/[^A-Za-z0-9]/-/g')"
+
+mapfile -t found < <(find "$projects" -mindepth 2 -maxdepth 2 -type f -name "$id.jsonl" ! -path "$to/*")
+if [ "${#found[@]}" -eq 0 ]; then
+  [ -f "$to/$id.jsonl" ] && die "session is already in the target: $to"
+  die "session not found: $id"
+fi
+[ "${#found[@]}" -eq 1 ] || die "session found in several projects: ${found[*]}"
+source_file="${found[0]}"
+from="$(dirname "$source_file")"
+
+[ ! -e "$to/$id.jsonl" ] || die "target already has this session: $to/$id.jsonl"
+
+# A recently changed file usually means the session is still open.
+if [ -n "$(find "$source_file" -mmin -1)" ]; then
+  say "Warning: this session changed in the last minute. If it's still open, exit it first,"
+  say "or the copy will be missing the newest messages."
+fi
+
+say "From: $from"
+say "To:   $to"
+say "Copy: $id.jsonl ($(du -h "$source_file" | cut -f1))"
+[ ! -d "$from/$id" ] || say "Copy: $id/ (session files)"
+
+new_notes=()
+if [ "$memory" = 1 ] && [ -d "$from/memory" ]; then
+  while IFS= read -r note; do
+    name="$(basename "$note")"
+    if [ -e "$to/memory/$name" ]; then
+      say "Keep: memory/$name (target already has it)"
+    else
+      say "Copy: memory/$name"
+      new_notes+=("$name")
+    fi
+  done < <(find "$from/memory" -maxdepth 1 -type f -name '*.md' ! -name MEMORY.md | sort)
+fi
+
+if [ "$dry" = 1 ]; then
+  say "Dry run: nothing was changed."
+  exit 0
+fi
+
+mkdir -p "$to"
+cp -p "$source_file" "$to/"
+if [ -d "$from/$id" ] && [ ! -e "$to/$id" ]; then
+  cp -pR "$from/$id" "$to/"
+fi
+
+if [ "${#new_notes[@]}" -gt 0 ]; then
+  mkdir -p "$to/memory"
+  for name in "${new_notes[@]}"; do
+    cp -p "$from/memory/$name" "$to/memory/"
+    # Add the note's index line to the target's index, once.
+    if [ -f "$from/memory/MEMORY.md" ]; then
+      line="$(grep -F "($name)" "$from/memory/MEMORY.md" || true)"
+      if [ -n "$line" ] && ! grep -qF "($name)" "$to/memory/MEMORY.md" 2>/dev/null; then
+        printf '%s\n' "$line" >> "$to/memory/MEMORY.md"
+      fi
+    fi
+  done
+fi
+
+say ""
+say "Copied. The original is untouched. To continue there:"
+say "  cd $(printf '%q' "$target") && claude --resume $id"
