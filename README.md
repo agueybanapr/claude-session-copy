@@ -58,3 +58,7 @@ cd /some/folder && claude --resume SESSION_ID
 
 Session files can contain anything said in a conversation, including secrets and private
 details. Don't commit or share them.
+
+## License
+
+[MIT](LICENSE)
