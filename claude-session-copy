@@ -8,35 +8,66 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: claude-session-copy [--dry-run] [--no-memory] SESSION_ID [TARGET_DIR]
+Usage: claude-session-copy [--dry-run] [--memory | --no-memory] SESSION_ID [TARGET_DIR]
 
 Copies SESSION_ID to the project for TARGET_DIR (default: your home folder), then prints
 the command to resume it there. Exit Claude in that session first.
 
   --dry-run    show what would be copied, and change nothing
+  --memory     also copy memory notes when the target is your home folder (or above it)
   --no-memory  copy only the conversation, not the project's memory notes
+
+Memory notes are copied by default, except into your home folder's project (or a folder
+above it): notes there load in every session you start from ~, so that needs --memory.
 EOF
 }
 
 die() { printf 'claude-session-copy: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 
-dry=0; memory=1; args=()
+# Resolve a folder to its real path. CDPATH is cleared so cd never picks another folder.
+real_dir() { (CDPATH='' cd -- "$1" 2>/dev/null && pwd -P); }
+
+# Copy a file to a name that must not exist yet. The copy is made under a temporary name
+# and then hard-linked into place; ln refuses to replace an existing file, so a file that
+# appears in the meantime (another session, a second run) is never overwritten.
+copy_new() {  # copy_new SOURCE DEST
+  local tmp
+  tmp="$(mktemp "$(dirname -- "$2")/.claude-session-copy.XXXXXX")"
+  if ! cp -p -- "$1" "$tmp" || ! ln -- "$tmp" "$2" 2>/dev/null; then
+    rm -f -- "$tmp"
+    die "could not copy to $2 (it may have appeared while copying; it was left untouched)"
+  fi
+  rm -f -- "$tmp"
+}
+
+dry=0; memory=default; args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1 ;;
-    --no-memory) memory=0 ;;
+    --memory) memory=yes ;;
+    --no-memory) memory=no ;;
     -h|--help) usage; exit 0 ;;
     -*) usage >&2; exit 2 ;;
     *) args+=("$1") ;;
   esac
   shift
 done
-[ "${#args[@]}" -ge 1 ] && [ "${#args[@]}" -le 2 ] || { usage >&2; exit 2; }
+if [ "${#args[@]}" -lt 1 ] || [ "${#args[@]}" -gt 2 ]; then usage >&2; exit 2; fi
 
 id="${args[0]}"
 [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "not a session ID: $id"
-target="$(cd "${args[1]:-$HOME}" 2>/dev/null && pwd -P)" || die "no such folder: ${args[1]:-$HOME}"
+target="$(real_dir "${args[1]:-$HOME}")" || die "no such folder: ${args[1]:-$HOME}"
+home="$(real_dir "$HOME")" || die "no home folder: $HOME"
+
+# Memory notes copied to ~ (or above it) apply to every session started there, so that
+# needs an explicit --memory. Anywhere else they are copied unless --no-memory is given.
+broad=0
+if [ "$target" = / ]; then broad=1; fi
+case "$home/" in "$target"/*) broad=1 ;; esac
+if [ "$memory" = default ]; then
+  if [ "$broad" = 1 ]; then memory=no; else memory=yes; fi
+fi
 
 projects="$HOME/.claude/projects"
 [ -d "$projects" ] || die "no Claude projects at $projects"
@@ -64,19 +95,31 @@ fi
 say "From: $from"
 say "To:   $to"
 say "Copy: $id.jsonl ($(du -h "$source_file" | cut -f1))"
-[ ! -d "$from/$id" ] || say "Copy: $id/ (session files)"
+copy_dir=0
+if [ -d "$from/$id" ]; then
+  if [ -e "$to/$id" ]; then
+    say "Keep: $id/ (target already has it)"
+  else
+    say "Copy: $id/ (session files)"
+    copy_dir=1
+  fi
+fi
 
 new_notes=()
-if [ "$memory" = 1 ] && [ -d "$from/memory" ]; then
-  while IFS= read -r note; do
-    name="$(basename "$note")"
-    if [ -e "$to/memory/$name" ]; then
-      say "Keep: memory/$name (target already has it)"
-    else
-      say "Copy: memory/$name"
-      new_notes+=("$name")
-    fi
-  done < <(find "$from/memory" -maxdepth 1 -type f -name '*.md' ! -name MEMORY.md | sort)
+if [ -d "$from/memory" ]; then
+  if [ "$memory" = yes ]; then
+    while IFS= read -r note; do
+      name="$(basename "$note")"
+      if [ -e "$to/memory/$name" ]; then
+        say "Keep: memory/$name (target already has it)"
+      else
+        say "Copy: memory/$name"
+        new_notes+=("$name")
+      fi
+    done < <(find "$from/memory" -maxdepth 1 -type f -name '*.md' ! -name MEMORY.md | sort)
+  elif [ "$broad" = 1 ] && [ -n "$(find "$from/memory" -maxdepth 1 -type f -name '*.md' ! -name MEMORY.md)" ]; then
+    say "Skip: memory notes (the target is your home folder or above it; pass --memory to copy them)"
+  fi
 fi
 
 if [ "$dry" = 1 ]; then
@@ -85,19 +128,22 @@ if [ "$dry" = 1 ]; then
 fi
 
 mkdir -p "$to"
-cp -p "$source_file" "$to/"
-if [ -d "$from/$id" ] && [ ! -e "$to/$id" ]; then
-  cp -pR "$from/$id" "$to/"
+copy_new "$source_file" "$to/$id.jsonl"
+if [ "$copy_dir" = 1 ]; then
+  # mkdir without -p fails if the folder exists, so it is claimed only if it's still new.
+  mkdir -- "$to/$id" 2>/dev/null || die "$to/$id appeared while copying; it was left untouched"
+  cp -pR -- "$from/$id/." "$to/$id/"
 fi
 
 if [ "${#new_notes[@]}" -gt 0 ]; then
   mkdir -p "$to/memory"
   for name in "${new_notes[@]}"; do
-    cp -p "$from/memory/$name" "$to/memory/"
-    # Add the note's index line to the target's index, once.
+    copy_new "$from/memory/$name" "$to/memory/$name"
+    # Add the note's index line to the target's index, once. Index lines link the note
+    # as [Title](name.md), so match "](name.md)" exactly and take only the first line.
     if [ -f "$from/memory/MEMORY.md" ]; then
-      line="$(grep -F "($name)" "$from/memory/MEMORY.md" || true)"
-      if [ -n "$line" ] && ! grep -qF "($name)" "$to/memory/MEMORY.md" 2>/dev/null; then
+      line="$(grep -F -m1 -- "]($name)" "$from/memory/MEMORY.md" || true)"
+      if [ -n "$line" ] && ! grep -qF -- "]($name)" "$to/memory/MEMORY.md" 2>/dev/null; then
         printf '%s\n' "$line" >> "$to/memory/MEMORY.md"
       fi
     fi
